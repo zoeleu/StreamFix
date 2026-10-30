@@ -1,4 +1,4 @@
-// O `Controle` do macOS: sobe e derruba o tunel por `wg-quick`, e confere o que subiu.
+// O `Controle` do macOS e do Linux: sobe e derruba o tunel por `wg-quick`, e confere o que subiu.
 //
 // Mesma interface do `controle.ts` do WireSock, e pelo mesmo desenho: tudo aqui e decisao e
 // leitura, quem executa processo e injetado, e por isso o Node carrega este arquivo por
@@ -90,6 +90,27 @@ export const BASH4_PADRAO = "/opt/homebrew/bin/bash";
  * dentro dele sejam `600 root`. E por isso que `existe()` consegue responder sem sudo.
  */
 export const DIR_PERFIS = "/etc/wireguard";
+
+/**
+ * Os caminhos no Linux. Toda distribuicao corrente (Arch, Debian 12+, Ubuntu, Fedora, openSUSE)
+ * empacota o `wireguard-tools` em `/usr/bin` e ja fez o usrmerge, entao aqui nao ha o que
+ * descobrir como no Homebrew. O bash do sistema ja e 4+, mas continua sendo chamado pelo caminho
+ * absoluto pela mesma razao do macOS: a regra de sudoers lista `<bash> <wg-quick> up <perfil>`
+ * exato, e o instalador escreve estes mesmos tres caminhos nela (teste de drift).
+ */
+export const WG_QUICK_LINUX = "/usr/bin/wg-quick";
+export const WG_LINUX = "/usr/bin/wg";
+export const BASH_LINUX = "/usr/bin/bash";
+
+/**
+ * O `ls` que lista o diretorio de perfis no Linux, **por sudo**.
+ *
+ * Diferente do macOS: la o `/etc/wireguard` e `drwxr-xr-x`, aqui o pacote o cria `drwx------
+ * root` (medido em 30/10 no Arch, `wireguard-tools v1.0.20260223`). Sem privilegio a listagem
+ * falha, `existe()` responderia `desconhecido` para sempre, e o plugin ficaria no completo a
+ * sessao inteira. A regra de sudoers libera exatamente `ls -1 /etc/wireguard`, sem curinga.
+ */
+export const LS_LINUX = "/usr/bin/ls";
 
 /** Toda operacao de `wg-quick` e local e responde rapido. Nenhuma delas espera rede. */
 export const PRAZO_CURTO_MS = 5_000;
@@ -264,6 +285,11 @@ export interface OpcoesControleWg {
     /** O bash 4+ que executa o `wg-quick`. Ver `BASH4_PADRAO`. */
     bash?: string;
     dirPerfis?: string;
+    /**
+     * Listar o diretorio de perfis por `sudo -n <ls>`, e nao direto. Ver `LS_LINUX`: no Linux o
+     * diretorio e so-root. Vazio (o padrao) e o macOS, que lista sem privilegio por `/bin/ls`.
+     */
+    lsComSudo?: string;
     dormir?: (ms: number) => Promise<void>;
     agora?: () => number;
     prazoHandshakeMs?: number;
@@ -496,8 +522,9 @@ export function controleWgQuick(opcoes: OpcoesControleWg): Controle {
     /**
      * Se o perfil esta escrito no disco.
      *
-     * Nao precisa de sudo: o diretorio e `drwxr-xr-x`, so os `.conf` dentro dele e que sao
-     * `600 root`. Listar basta, e ler nao e preciso.
+     * No macOS nao precisa de sudo: o diretorio e `drwxr-xr-x`, so os `.conf` dentro dele e que
+     * sao `600 root`. No Linux o diretorio inteiro e so-root, e a listagem vai por `lsComSudo`.
+     * Nos dois, listar basta, e ler nao e preciso.
      *
      * **Nao saber e um terceiro estado**, pela mesma razao do `controle.ts`: logo depois do boot
      * uma leitura que falha nao pode ser lida como "o perfil nao existe", ou o plugin ficaria no
@@ -506,9 +533,9 @@ export function controleWgQuick(opcoes: OpcoesControleWg): Controle {
     async function existe(perfil: string): Promise<boolean | "desconhecido"> {
         let listagem: string;
         try {
-            listagem = await opcoes.executar("/bin/ls", ["-1", dirPerfis], {
-                tempoLimiteMs: PRAZO_CURTO_MS
-            });
+            listagem = opcoes.lsComSudo
+                ? await rodar(opcoes.lsComSudo, "-1", dirPerfis)
+                : await opcoes.executar("/bin/ls", ["-1", dirPerfis], { tempoLimiteMs: PRAZO_CURTO_MS });
         } catch {
             return "desconhecido";
         }

@@ -115,7 +115,8 @@ async function principal() {
     // `wg-quick` do macOS tambem nomeia pelo arquivo, entao a regra vale nos dois.
     const perfil = basename(arquivo).replace(/\.conf$/i, "");
 
-    // O macOS muda duas coisas no perfil, e as duas vem de `controle-wg.ts`:
+    // O macOS e o Linux (os dois por `wg-quick`) mudam duas coisas no perfil, e as duas vem de
+    // `controle-wg.ts`:
     //
     //   - **o nome do perfil de controle e curto.** O `wg-quick` so aceita ate 15 caracteres, e
     //     o `-controle` do Windows sozinho come 9 deles (medido em 17/09).
@@ -124,9 +125,10 @@ async function principal() {
     //
     // `--plataforma` existe para o teste poder exercitar o ramo do macOS rodando em qualquer
     // sistema, do mesmo jeito que o OS_NAME do instalador de shell.
-    const ehMac = (opcao("plataforma") ?? platform) === "darwin";
+    const plataforma = opcao("plataforma") ?? platform;
+    const usaWgQuick = plataforma === "darwin" || plataforma === "linux";
 
-    if (ehMac && !nomeValido(perfil)) {
+    if (usaWgQuick && !nomeValido(perfil)) {
         responde({
             ok: false,
             erro: `o wg-quick nao aceita o perfil "${perfil}": ele so aceita nomes de ate 15`
@@ -183,14 +185,14 @@ async function principal() {
         // maquina onde se testava de verdade usava um perfil escrito a mao, anterior a isto.
         // O padrao de `gerarPerfil` -- 0.0.0.0/0 -- sempre esteve certo; o erro era sobrescreve-lo.
         apps,
-        semSplitPorApp: ehMac
+        semSplitPorApp: usaWgQuick
     };
 
     // Tunel em dois niveis: o mesmo registro vira dois perfis. O completo, com o padrao de
     // `gerarPerfil`, e o de controle, com so a FAIXA_CONTROLE. Mesma chave e mesmo endereco --
     // e isso que deixa o gateway do Discord sobreviver a troca entre eles (pesquisa, 12h). Um
     // convite continua valendo um peer.
-    const perfilControle = ehMac ? perfilDeControleCurto(perfil) : perfilDeControle(perfil);
+    const perfilControle = usaWgQuick ? perfilDeControleCurto(perfil) : perfilDeControle(perfil);
     const arquivoControle = join(dirname(arquivo), `${perfilControle}.conf`);
     const escritos = [];
     try {

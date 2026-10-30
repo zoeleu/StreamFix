@@ -1256,9 +1256,12 @@ select_target() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# O tunel (macOS)
+# O tunel (macOS e Linux)
 #
 # Espelha o que o StreamFix-Installer.ps1 faz no Windows, com o WireSock trocado pelo wg-quick.
+# Os dois sistemas dividem tudo daqui para baixo, menos a instalacao do wireguard-tools: no
+# macOS ela passa pelo Homebrew e precisa de um bash 4+; no Linux passa pelo gerenciador da
+# distribuicao, o bash do sistema ja serve, e o /etc/wireguard e so-root (ver LS_LINUX).
 # O contrato do wg-quick esta medido em docs/research/wg-quick-no-darwin-2026-09-17.md, e tres
 # achados de la governam este bloco:
 #
@@ -1348,6 +1351,122 @@ macos_ensure_bash4() {
     ok "bash para o wg-quick: $BASH4"
 }
 
+# ----------------------------------------------------------------------------- Linux
+
+# Os mesmos caminhos de WG_QUICK_LINUX, WG_LINUX, BASH_LINUX e LS_LINUX em controle-wg.ts: o
+# plugin chama exatamente estes, e a regra de sudoers so casa se as duas pontas concordarem (teste
+# de drift). Nenhuma distribuicao corrente poe o wireguard-tools fora de /usr/bin.
+LINUX_WG_QUICK="/usr/bin/wg-quick"
+LINUX_WG="/usr/bin/wg"
+LINUX_BASH="/usr/bin/bash"
+LINUX_LS="/usr/bin/ls"
+
+# O gerenciador de pacotes da distribuicao, ou nada.
+linux_package_manager() {
+    local pm
+    for pm in pacman apt-get dnf zypper; do
+        have "$pm" && { printf '%s
+' "$pm"; return 0; }
+    done
+    return 1
+}
+
+linux_resolved_active() {
+    have systemctl && systemctl is-active --quiet systemd-resolved 2>/dev/null
+}
+
+# Os pacotes que faltam, no nome que cada distribuicao usa.
+#
+# **O `resolvconf` nao e opcional.** O perfil tem `DNS = 1.1.1.1` (ver `dns` em perfil.ts: sem
+# ele o Discord resolve do Brasil e recebe servidor brasileiro), e no Linux o wg-quick aplica essa
+# linha chamando `resolvconf`. Sem ele, `wg-quick up` falha inteiro com "resolvconf: command not
+# found" -- nenhuma das distribuicoes grandes o traz por padrao. Com o systemd-resolved no ar, o
+# certo e o shim dele; sem, o openresolv.
+linux_wireguard_packages() {
+    local pm="$1" pkgs=()
+    have wg-quick && have wg || pkgs+=("wireguard-tools")
+    if ! have resolvconf; then
+        case "$pm:$(linux_resolved_active && echo resolved || echo plain)" in
+            pacman:resolved) pkgs+=("systemd-resolvconf") ;;
+            apt-get:resolved) pkgs+=("systemd-resolved") ;;
+            dnf:resolved) pkgs+=("systemd-resolved") ;;
+            *) pkgs+=("openresolv") ;;
+        esac
+    fi
+    printf '%s
+' "${pkgs[@]}"
+}
+
+linux_install_packages() {
+    local pm="$1"; shift
+    case "$pm" in
+        pacman)  sudo pacman -S --needed --noconfirm "$@" ;;
+        apt-get) sudo apt-get install -y "$@" ;;
+        dnf)     sudo dnf install -y "$@" ;;
+        zypper)  sudo zypper --non-interactive install "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+linux_ensure_wireguard() {
+    local pm pkgs=()
+    if pm="$(linux_package_manager)"; then
+        mapfile -t pkgs < <(linux_wireguard_packages "$pm")
+    fi
+
+    if [ ${#pkgs[@]} -gt 0 ] && [ -n "${pkgs[0]}" ]; then
+        step "Instalando ${pkgs[*]} (pelo $pm; pode pedir a sua senha do sudo)"
+        linux_install_packages "$pm" "${pkgs[@]}" >/dev/null 2>&1             || fail "O $pm nao conseguiu instalar ${pkgs[*]}. Instale na mao e rode de novo."
+    fi
+
+    have wg-quick && have wg         || fail 'Preciso do wireguard-tools (wg e wg-quick). Instale pelo gerenciador da sua distribuicao e rode de novo.'
+    have resolvconf         || fail 'O wg-quick precisa do resolvconf para aplicar o DNS do perfil. Instale o openresolv (ou o shim do systemd-resolved) e rode de novo.'
+
+    # O plugin chama estes caminhos exatos, e a regra de sudoers tambem. Um wg-quick em outro
+    # lugar (compilado a mao em /usr/local) subiria pelo instalador e falharia no clique do Go
+    # Live, com o sudo pedindo senha que ninguem ve.
+    local caminho
+    for caminho in "$LINUX_WG_QUICK" "$LINUX_WG" "$LINUX_BASH" "$LINUX_LS"; do
+        [ -x "$caminho" ] || fail "Nao achei $caminho. O StreamFix chama o wireguard-tools por esse caminho exato."
+    done
+    BASH4="$LINUX_BASH"
+
+    # Quem gerencia o /etc/resolv.conf por fora do resolvconf (o Tailscale com MagicDNS, por
+    # exemplo) vai brigar com o DNS que o wg-quick aplica, e o Discord pode voltar a resolver
+    # do Brasil sem nada avisar. Nao da para consertar daqui; da para dizer.
+    if [ -r /etc/resolv.conf ] && grep -qi 'tailscale' /etc/resolv.conf 2>/dev/null; then
+        warn 'O /etc/resolv.conf e gerenciado pelo Tailscale. Ele pode sobrescrever o DNS do tunel; se o Go Live for recusado, desligue o "Use Tailscale DNS" ou o Tailscale durante a call.'
+    fi
+
+    ok 'wireguard-tools pronto.'
+}
+
+# O que cada sistema precisa ter antes de o tunel ser montado.
+ensure_wireguard() {
+    if [ "$OS_NAME" = "Darwin" ]; then
+        macos_ensure_wireguard
+    else
+        linux_ensure_wireguard
+    fi
+}
+
+# O Discord de flatpak roda o plugin dentro do sandbox, onde nao existe sudo nem wg: o native.ts
+# sai para o host por `flatpak-spawn --host`, e isso so funciona com o acesso ao portal do
+# Flatpak liberado. Sem ele toda troca de tunel falharia, e o Go Live seria recusado.
+grant_flatpak_host_spawn() {
+    local id="$1" nome="org.freedesktop.Flatpak"
+    have flatpak || return 0
+    flatpak info --show-permissions "$id" 2>/dev/null | grep -q "$nome=talk" && return 0
+
+    if flatpak_is_user_install "$id"; then
+        flatpak override --user "$id" --talk-name="$nome" >/dev/null 2>&1 && return 0
+    else
+        step "Deixando o $id operar o tunel do host (pode pedir sua senha do sudo)"
+        sudo flatpak override "$id" --talk-name="$nome" >/dev/null 2>&1 && return 0
+    fi
+    warn "Nao consegui liberar o $nome para o $id. Rode: flatpak override --talk-name=$nome $id"
+}
+
 # Toda chamada ao wg-quick passa por aqui. Nenhuma o chama direto, de proposito.
 wgq() {
     sudo "$BASH4" "$(command -v wg-quick)" "$@"
@@ -1388,14 +1507,16 @@ stage_provisioner() {
     printf '%s\n' "$dir"
 }
 
-macos_provision_tunnel() {
+provision_tunnel() {
     local convite="$1" url="$2" chave="$3"
     local tmp arquivo prov
     tmp="$(mktemp -d)"
     # O nome do perfil sai do nome do ARQUIVO, no wg-quick como no WireSock.
     arquivo="$tmp/$TUNNEL_PROFILE.conf"
 
-    local args=(--url "$url" --arquivo "$arquivo" --plataforma darwin)
+    local plataforma="linux"
+    [ "$OS_NAME" = "Darwin" ] && plataforma="darwin"
+    local args=(--url "$url" --arquivo "$arquivo" --plataforma "$plataforma")
     [ -n "$chave" ] && args+=(--chave-da-saida "$chave")
 
     # O provisionador e montado ANTES de o convite ser usado: se faltar um modulo, a falha
@@ -1437,9 +1558,9 @@ tunnel_field() {
 #
 # `install -m 600` em vez de `cp` seguido de `chmod`: ele cria o arquivo ja com o modo certo, sem
 # o instante em que um arquivo com a chave privada dentro existe legivel para outra conta.
-macos_install_profiles() {
+install_profiles() {
     local tmp="$1" perfil
-    step "Instalando os perfis em $WG_DIR (o macOS vai pedir a sua senha)"
+    step "Instalando os perfis em $WG_DIR (pode pedir a sua senha do sudo)"
     sudo mkdir -p "$WG_DIR" || fail "Nao consegui criar $WG_DIR."
     for perfil in "$TUNNEL_PROFILE" "$TUNNEL_PROFILE_CTL"; do
         sudo install -m 600 -o root "$tmp/$perfil.conf" "$WG_DIR/$perfil.conf" \
@@ -1463,7 +1584,7 @@ macos_install_profiles() {
 # **Por que passa pelo `visudo -c` antes.** Um arquivo invalido em /etc/sudoers.d pode quebrar o
 # sudo da maquina inteira, e esse nao e um estrago que este instalador pode se dar ao luxo de
 # causar. A regra e escrita num temporario, validada la, e so entao movida para o lugar.
-macos_write_sudoers() {
+write_sudoers() {
     local wg_quick wg_bin tmp
     wg_quick="$(command -v wg-quick)"
     wg_bin="$(command -v wg)"
@@ -1472,13 +1593,22 @@ macos_write_sudoers() {
     # O interpretador entra na regra porque ele entra na chamada (ver macos_ensure_bash4).
     # Sem ele aqui, o sudo veria um comando diferente do autorizado e pediria senha no clique
     # do Go Live -- justamente o que esta regra existe para evitar.
-    printf '%s ALL=(root) NOPASSWD: %s %s up %s, %s %s down %s, %s %s up %s, %s %s down %s, %s show *\n' \
+    # No Linux o /etc/wireguard e so-root (diferente do macOS), entao ate saber se o perfil
+    # existe exige privilegio: a regra libera esse `ls` exato, e nada mais dele.
+    local extra=""
+    if [ "$OS_NAME" != "Darwin" ]; then
+        wg_quick="$LINUX_WG_QUICK"
+        wg_bin="$LINUX_WG"
+        extra=", $LINUX_LS -1 $WG_DIR"
+    fi
+
+    printf '%s ALL=(root) NOPASSWD: %s %s up %s, %s %s down %s, %s %s up %s, %s %s down %s, %s show *%s\n' \
         "$USER" \
         "$BASH4" "$wg_quick" "$TUNNEL_PROFILE" \
         "$BASH4" "$wg_quick" "$TUNNEL_PROFILE" \
         "$BASH4" "$wg_quick" "$TUNNEL_PROFILE_CTL" \
         "$BASH4" "$wg_quick" "$TUNNEL_PROFILE_CTL" \
-        "$wg_bin" > "$tmp"
+        "$wg_bin" "$extra" > "$tmp"
     chmod 440 "$tmp"
 
     if ! sudo visudo -c -f "$tmp" >/dev/null 2>&1; then
@@ -1498,7 +1628,7 @@ macos_write_sudoers() {
 # Nao confere o handshake aqui, de proposito: um `up` que devolve 0 nao prova nada (achado 4 da
 # medicao), e quem sabe conferir e o `controle-wg.ts`, que tem teste. Repetir essa logica em bash
 # seria duplicar em linguagem sem teste uma decisao que ja existe testada.
-macos_bring_up_control() {
+bring_up_control() {
     step 'Subindo o tunel de controle'
     wgq down "$TUNNEL_PROFILE" >/dev/null 2>&1 || true
     wgq down "$TUNNEL_PROFILE_CTL" >/dev/null 2>&1 || true
@@ -1603,9 +1733,11 @@ do_install() {
         fail "$(checkout_mod "$root") no macOS so injeta pela janela do instalador do mod, e o modo sem perguntas (--yes) nao tem quem clique nela. Rode sem --yes, ou escolha Equicord (--mod equicord), que tem build de linha de comando para o macOS."
     fi
 
-    # O tunel so tem implementacao para macOS por enquanto. O Linux cai fora antes daqui, no
-    # refuse_install_for_now -- este ramo nunca ve outro sistema.
-    [ "$OS_NAME" = "Darwin" ] || fail 'O tunel ainda so tem caminho para macOS neste instalador.'
+    # O tunel so tem caminho para macOS e Linux.
+    case "$OS_NAME" in
+        Darwin|Linux) ;;
+        *) fail 'O tunel so tem caminho para macOS e Linux neste instalador.' ;;
+    esac
 
     local permanent=0
     select_persistence "$root" || permanent=1
@@ -1613,11 +1745,11 @@ do_install() {
     # O tunel e montado ANTES do plugin, e ativar o plugin e o ultimo passo de todos. Um estado
     # pela metade que PARECE pronto e pior do que nenhum estado: se a instalacao parar no meio, a
     # pessoa fica sem plugin, e nao com um plugin ligado e sem tunel por baixo.
-    macos_ensure_wireguard
+    ensure_wireguard
 
     local convite tmp perfil endpoint
     convite="$(ask_invite)"
-    tmp="$(macos_provision_tunnel "$convite" "$EXIT_URL" "$EXIT_KEY")"
+    tmp="$(provision_tunnel "$convite" "$EXIT_URL" "$EXIT_KEY")"
     # O convite ja foi trocado por um peer; nao ha mais motivo para ele existir nesta sessao.
     convite=""
 
@@ -1626,13 +1758,13 @@ do_install() {
     [ -n "$perfil" ] && [ -n "$endpoint" ] \
         || { rm -rf "$tmp"; fail 'O provisionador nao devolveu o perfil e o endereco da saida.'; }
 
-    macos_install_profiles "$tmp"
+    install_profiles "$tmp"
     # Os arquivos ja estao em /etc/wireguard; o temporario tem a chave privada dentro e nao pode
     # sobreviver a esta funcao.
     rm -rf "$tmp"
 
-    macos_write_sudoers
-    macos_bring_up_control
+    write_sudoers
+    bring_up_control
 
     ensure_toolchain
     copy_plugin "$root"
@@ -1647,6 +1779,11 @@ do_install() {
         inject_mod "$root"
     fi
 
+    local flatpak_id
+    if [ "$OS_NAME" != "Darwin" ] && flatpak_id="$(injected_flatpak_id "$root")"; then
+        grant_flatpak_host_spawn "$flatpak_id"
+    fi
+
     # Com o Discord fechado: aberto, ele regrava o settings.json a partir da memoria e
     # apaga o que escrevemos aqui.
     set_plugin_settings "$root" "$perfil" "$endpoint"
@@ -1658,8 +1795,9 @@ do_install() {
     printf '  %sSaida: %s%s\n' "$C_DIM" "$endpoint" "$C_OFF"
     printf '  %sTunel: %s (controle) e %s (completo, emprestado por segundos)%s\n' \
         "$C_DIM" "$TUNNEL_PROFILE_CTL" "$TUNNEL_PROFILE" "$C_OFF"
-    # A diferenca que o macOS tem em relacao ao Windows, dita uma vez, no lugar onde importa.
-    printf '  %sNo macOS o corte e por tempo: durante esses segundos o Mac inteiro sai pela saida.%s\n' \
+    # A diferenca que o macOS e o Linux tem em relacao ao Windows, dita uma vez, no lugar onde
+    # importa.
+    printf '  %sO corte e por tempo: durante esses segundos a maquina inteira sai pela saida.%s\n' \
         "$C_DIM" "$C_OFF"
     printf '  %sEntre numa call e use Go Live ou a camera.%s\n' "$C_DIM" "$C_OFF"
 
@@ -1694,14 +1832,16 @@ do_uninstall() {
 # **A regra de sudoers e o item que mais importa remover.** Ela e a unica coisa que este
 # instalador deixa na maquina com poder de root, e alguem que desinstala o StreamFix nao espera
 # continuar com uma autorizacao permanente para um programa que nao esta mais la.
-macos_remove_tunnel() {
-    [ "$OS_NAME" = "Darwin" ] || return 0
+remove_tunnel() {
+    case "$OS_NAME" in Darwin|Linux) ;; *) return 0 ;; esac
     have wg-quick || return 0
 
     # O --restore nao passa pela instalacao, entao o BASH4 ainda esta vazio aqui. Sem isto o
     # `wgq` chamaria `sudo "" wg-quick` e a limpeza falharia em silencio -- deixando para tras
     # justamente a regra de sudoers, que e a parte que mais importa remover.
-    [ -n "$BASH4" ] || macos_ensure_bash4
+    if [ -z "$BASH4" ]; then
+        if [ "$OS_NAME" = "Darwin" ]; then macos_ensure_bash4; else BASH4="$LINUX_BASH"; fi
+    fi
 
     step 'Derrubando o tunel e removendo os perfis'
     wgq down "$TUNNEL_PROFILE" >/dev/null 2>&1 || true
@@ -1718,7 +1858,7 @@ macos_remove_tunnel() {
 do_restore_everything() {
     local root target bundle=""
 
-    macos_remove_tunnel
+    remove_tunnel
 
     if root="$(find_checkout)"; then
         target="$root/src/userplugins/$PLUGIN_DIR_NAME"
@@ -1740,36 +1880,6 @@ do_restore_everything() {
     ok "Tudo restaurado. Seu Discord voltou ao normal."
 }
 
-# O Linux ainda nao tem caminho de tunel neste instalador.
-#
-# **O que falta nao e o `Controle`.** O `controle-wg.ts` fala com o `wg-quick`, que existe no
-# Linux tambem, e a identificacao dele -- por destinos, e nao por nome de interface -- funciona
-# nos dois sistemas. O que falta e o lado do instalador: cada distribuicao instala o
-# wireguard-tools de um jeito, o wg-quick de la usa o modulo do kernel em vez do wireguard-go, e
-# nada disso foi medido. Habilitar sem medir seria repetir exatamente o erro que a medicao do
-# Darwin acabou de evitar.
-#
-# Recusar dizendo por que e melhor do que instalar algo quebrado e deixar a pessoa descobrir
-# sozinha, que e o modo de falha que este projeto mais pagou caro.
-refuse_install_for_now() {
-    printf '\n  %sA instalacao em Linux ainda nao esta pronta.%s\n\n' "$C_YELLOW" "$C_OFF"
-    printf '  O StreamFix depende de um tunel WireGuard. O controle dele ja serve o Linux, mas\n'
-    printf '  o lado do instalador -- instalar o wireguard-tools em cada distribuicao, e o que\n'
-    printf '  muda no wg-quick com o modulo do kernel -- ainda nao foi medido em lugar nenhum.\n\n'
-    printf '  %sHoje o caminho e o Windows ou o macOS.%s\n' "$C_DIM" "$C_OFF"
-    printf '  %sAcompanhe em https://github.com/EduardoVasconceloss/StreamFix%s\n' "$C_DIM" "$C_OFF"
-    return 1
-}
-
-# Instalar so segue onde ha caminho de tunel medido. Hoje: macOS.
-install_or_refuse() {
-    if [ "$OS_NAME" = "Darwin" ]; then
-        do_install "$@"
-    else
-        refuse_install_for_now
-    fi
-}
-
 main_menu() {
     local root
     root="$(find_checkout || true)"
@@ -1784,7 +1894,7 @@ main_menu() {
     local choice
     read -r -p "  Escolha: " choice
     case "$choice" in
-        1) install_or_refuse ;;
+        1) do_install ;;
         2) do_uninstall ;;
         3) do_restore_everything ;;
         *) printf '  %sAte mais.%s\n' "$C_DIM" "$C_OFF" ;;
@@ -1798,7 +1908,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     ensure_not_root
     banner
     case "$MODE" in
-        install) install_or_refuse ;;
+        install) do_install ;;
         uninstall) do_uninstall ;;
         restore) do_restore_everything ;;
         *) main_menu ;;

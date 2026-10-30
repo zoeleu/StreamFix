@@ -27,7 +27,7 @@ const {
     nomeValido, perfilDeControleCurto, normalizarDestinos, mesmosDestinos,
     lerInterfaces, destinosDaInterface, interfaceComDestinos, fechouHandshake, perfisDaListagem,
     LIMITE_NOME, SUFIXO_CONTROLE, PRAZO_CURTO_MS, WG_QUICK_PADRAO, WG_PADRAO, DIR_PERFIS,
-    BASH4_PADRAO,
+    BASH4_PADRAO, WG_QUICK_LINUX, WG_LINUX, BASH_LINUX, LS_LINUX,
 } = require("../streamFix/tunnel/controle-wg.ts");
 
 const COMPLETO = "streamfix";
@@ -91,6 +91,8 @@ function cliFalso(roteiro) {
 
 function chaveDe(exe, args) {
     if (exe === "/bin/ls") return "ls";
+    // No Linux a listagem vai por `sudo -n /usr/bin/ls -1 /etc/wireguard` (ver LS_LINUX).
+    if (exe === "sudo" && String(args[1]).endsWith("/ls")) return "sudo ls";
     // O wg-quick e sempre executado por um bash 4+ explicito (o macOS traz o 3.2), entao a forma
     // e `sudo -n <bash> <wg-quick> up <perfil>`. O `wg` e binario e vai direto.
     const [, alvo, ...resto] = args;
@@ -416,6 +418,32 @@ test("nao conseguir listar e 'desconhecido', nunca 'nao existe'", async () => {
         await controle.existe(COMPLETO), "desconhecido",
         "ler isto como 'nao existe' deixaria o plugin no completo pela sessao inteira"
     );
+});
+
+test("no Linux a listagem vai por sudo, porque o /etc/wireguard e so-root", async () => {
+    // Medido em 30/10 no Arch: `drwx------ root`. Um `ls` sem privilegio da Permission denied,
+    // e `existe()` ficaria em `desconhecido` para sempre.
+    const { controle, chamadas } = montar({ "sudo ls": LISTAGEM }, { lsComSudo: "/usr/bin/ls" });
+    assert.equal(await controle.existe(CONTROLE), true);
+    assert.equal(await controle.existe("nao-existe"), false);
+    assert.deepEqual([...chamadas[0]], ["sudo", "-n", "/usr/bin/ls", "-1", DIR_PERFIS]);
+});
+
+test("no Linux, o sudo recusando a listagem e 'desconhecido'", async () => {
+    const { controle } = montar(
+        { "sudo ls": new Error("sudo: a password is required") },
+        { lsComSudo: "/usr/bin/ls" }
+    );
+    assert.equal(await controle.existe(COMPLETO), "desconhecido");
+});
+
+test("os caminhos do Linux sao os de /usr/bin", () => {
+    // A regra de sudoers do instalador lista estes mesmos caminhos (teste de drift em
+    // instalador.test.cjs).
+    assert.equal(WG_QUICK_LINUX, "/usr/bin/wg-quick");
+    assert.equal(WG_LINUX, "/usr/bin/wg");
+    assert.equal(BASH_LINUX, "/usr/bin/bash");
+    assert.equal(LS_LINUX, "/usr/bin/ls");
 });
 
 test("listagem vazia tambem e 'desconhecido'", async () => {

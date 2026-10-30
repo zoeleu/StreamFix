@@ -20,6 +20,7 @@ import { criarEmprestimos, FOLGA_NASCIMENTO_MS, Motivo, Nivel, nivel, PRAZO_NASC
 import { decidirEntrada, PRAZO_ATE_DEVOLVER_MS } from "./tunnel/entrada";
 import { Estado, Veredito } from "./tunnel/monitor";
 import { observar } from "./tunnel/observador";
+import { perfilDeControleCurto } from "./tunnel/controle-wg";
 import { perfilDeControle } from "./tunnel/perfil";
 import { aviso, conferirNascimento, decidirClique, donoDoStream, hostDoEndpoint } from "./tunnel/porteiro";
 import { decidirTrava, descreverTrava, ESPERA_DEPOIS_DO_GATEWAY_MS, LeituraTrava, lerMarca, lerTrava, Marca, VIDEO_GUARD } from "./tunnel/trava";
@@ -166,9 +167,17 @@ function anotar(texto: string) {
     if (registro.length > 15) registro.shift();
 }
 
+/**
+ * O `wg-quick` (macOS e Linux) so aceita nomes de ate 15 caracteres, e o instalador de shell
+ * escreve o controle com o sufixo curto (`streamfix-ctl`). Derivar com o `-controle` do WireSock
+ * procuraria um perfil que nao existe -- e foi o que o macOS fez ate aqui: `perfilExiste` dizia
+ * "nao", e o plugin ficava no completo a sessao inteira.
+ */
+const USA_WG_QUICK = !/^win/i.test(navigator.platform ?? "");
+
 function perfis() {
     const completo = settings.store.perfilDoTunel;
-    return { completo, controle: perfilDeControle(completo) };
+    return { completo, controle: USA_WG_QUICK ? perfilDeControleCurto(completo) : perfilDeControle(completo) };
 }
 
 /** O tunel em dois niveis vale agora. Fora dele, o completo fica no ar o tempo todo. */

@@ -1142,31 +1142,39 @@ test_guarda_de_sourcing() {
 
 # --------------------------------------------------------------------------- tunel ausente
 
-# O Linux nao tem implementacao de tunel (adiado em 11/09/2026), e sem tunel o plugin nao serve
-# para nada. Este teste guarda a guarda: se alguem religar a instalacao antes de o wg-quick
-# existir, isto falha -- em vez de a pessoa descobrir com um plugin instalado que nao funciona.
-test_recusa_de_instalacao() {
-    printf '\n== instalacao recusada enquanto o tunel nao tem Linux ==\n'
+# O Linux instala o wireguard-tools e um resolvconf pelo gerenciador da distribuicao. O
+# resolvconf importa: sem ele o `DNS =` do perfil derruba o `wg-quick up` inteiro.
+test_pacotes_linux() {
+    printf '\n== tunel (Linux): pacotes por distribuicao ==\n'
 
-    local saida codigo
-    saida="$(cd "$TESTS_DIR" && bash -c 'source "../streamfix-installer.sh"; refuse_install_for_now' < /dev/null 2>&1)"
-    codigo=$?
+    local saida
+    saida="$(cd "$TESTS_DIR" && bash -c '
+        source "../streamfix-installer.sh"
+        have() { return 1; }
+        linux_resolved_active() { return 1; }
+        linux_wireguard_packages pacman | tr "\n" " "
+    ')"
+    assert_eq "pacman sem nada: wireguard-tools e openresolv" "wireguard-tools openresolv " "$saida"
 
-    assert_true "recusar devolve codigo de falha" [ "$codigo" -ne 0 ]
-    case "$saida" in
-        *tunel*) assert_true "a recusa explica que o motivo e o tunel" true ;;
-        *) assert_true "a recusa explica que o motivo e o tunel" false ;;
-    esac
+    saida="$(cd "$TESTS_DIR" && bash -c '
+        source "../streamfix-installer.sh"
+        have() { return 1; }
+        linux_resolved_active() { return 0; }
+        linux_wireguard_packages pacman | tr "\n" " "
+    ')"
+    assert_eq "pacman com systemd-resolved: o shim dele, nao o openresolv" "wireguard-tools systemd-resolvconf " "$saida"
 
-    # do_install ainda existe, mas nada no caminho de quem instala pode chamar ela.
-    local chamadas
-    chamadas="$(grep -cE '^\s+(1\)|install\))\s+do_install' "$TESTS_DIR/../streamfix-installer.sh")"
-    assert_eq "nenhum caminho de instalacao chama do_install" "0" "$chamadas"
+    saida="$(cd "$TESTS_DIR" && bash -c '
+        source "../streamfix-installer.sh"
+        have() { return 0; }
+        linux_wireguard_packages apt-get | tr "\n" " "
+    ')"
+    assert_eq "com tudo instalado, nada a instalar" "" "$(printf '%s' "$saida" | tr -d ' ')"
 }
 
 # ------------------------------------------------------------------------------------ main
 
-test_recusa_de_instalacao
+test_pacotes_linux
 test_pacote_nativo
 test_bootstrap_usuario
 test_flatpak_sistema

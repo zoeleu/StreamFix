@@ -2,7 +2,7 @@
 // processo.
 //
 // Fino de proposito, como o `observador`: toda decisao vive em `tunnel/controle.ts` (Windows) e
-// `tunnel/controle-wg.ts` (macOS), os dois testados contra as saidas reais dos CLIs. O que sobra
+// `tunnel/controle-wg.ts` (macOS e Linux), os dois testados contra as saidas reais dos CLIs. O que sobra
 // aqui e `execFile` com prazo -- e o prazo e a parte que importa, porque
 // `wiresock-connect-cli connect` nao volta nunca quando o handshake nao fecha. Medido em 11/09.
 //
@@ -14,10 +14,13 @@
 
 import { execFile } from "child_process";
 import type { IpcMainInvokeEvent } from "electron";
+import { existsSync } from "fs";
 
 import type { Controle } from "./tunnel/controle";
 import { controleWireSock, Resultado } from "./tunnel/controle";
-import { controleWgQuick, SUFIXO_CONTROLE } from "./tunnel/controle-wg";
+import {
+    BASH_LINUX, controleWgQuick, LS_LINUX, OpcoesControleWg, SUFIXO_CONTROLE, WG_LINUX, WG_QUICK_LINUX
+} from "./tunnel/controle-wg";
 import { FAIXA_CONTROLE } from "./tunnel/perfil";
 
 /**
@@ -46,6 +49,25 @@ function executar(exe: string, args: string[], { tempoLimiteMs }: { tempoLimiteM
 }
 
 const ehMac = process.platform === "darwin";
+const ehLinux = process.platform === "linux";
+const usaWgQuick = ehMac || ehLinux;
+
+/**
+ * O Discord de flatpak roda num sandbox sem `sudo`, sem `wg` e sem `/etc/wireguard`: tudo o que
+ * o controle executa tem de sair para o host, por `flatpak-spawn --host`. O instalador libera o
+ * `--talk-name=org.freedesktop.Flatpak` que isso exige; sem ele o spawn falha, e a falha vira
+ * `desconhecido`/recusa como qualquer outra -- nunca um tunel dado por bom.
+ */
+const noFlatpak = ehLinux && (!!process.env.FLATPAK_ID || existsSync("/.flatpak-info"));
+
+const executarNoHost: typeof executar = noFlatpak
+    ? (exe, args, opcoes) => executar("flatpak-spawn", ["--host", exe, ...args], opcoes)
+    : executar;
+
+/** O que muda entre o `wg-quick` do macOS (os padroes de `controle-wg.ts`) e o do Linux. */
+const extrasDaPlataforma: Partial<OpcoesControleWg> = ehLinux
+    ? { wgQuick: WG_QUICK_LINUX, wg: WG_LINUX, bash: BASH_LINUX, lsComSudo: LS_LINUX }
+    : {};
 
 /**
  * Os destinos que cada perfil deve carregar, deduzidos do nome.
@@ -71,15 +93,19 @@ function destinosPorConvencao(nomes: string[]): Record<string, string> {
 /**
  * O controle desta plataforma.
  *
- * No macOS ele e montado por chamada, e nao uma vez so: a tabela de identidade depende de quais
+ * No macOS e no Linux ele e montado por chamada, e nao uma vez so: a tabela de identidade depende de quais
  * perfis estao em jogo, e quem sabe isso e quem chamou. No Windows os nomes nao importam para
  * construir nada, entao a instancia e unica.
  */
-const controleWindows = ehMac ? null : controleWireSock({ executar });
+const controleWindows = usaWgQuick ? null : controleWireSock({ executar });
 
 function controlePara(nomes: string[]): Controle {
-    if (!ehMac) return controleWindows!;
-    return controleWgQuick({ executar, perfis: destinosPorConvencao(nomes) });
+    if (!usaWgQuick) return controleWindows!;
+    return controleWgQuick({
+        executar: executarNoHost,
+        perfis: destinosPorConvencao(nomes),
+        ...extrasDaPlataforma
+    });
 }
 
 // O plugin nunca derruba o tunel sem por outro no lugar: o nivel mais baixo e o controle, e
@@ -87,7 +113,7 @@ function controlePara(nomes: string[]): Controle {
 // nao ha `derrubar` aqui, so `trocar`.
 
 export function trocarTunel(_e: IpcMainInvokeEvent, perfil: string): Promise<Resultado & { duracaoMs: number }> {
-    // O outro nivel entra na tabela junto: o `trocar` do macOS precisa saber quem derrubar
+    // O outro nivel entra na tabela junto: o `trocar` do wg-quick precisa saber quem derrubar
     // depois de subir o novo, e sem o par ele nao derrubaria ninguem.
     return controlePara(parDePerfis(perfil)).trocar(perfil);
 }

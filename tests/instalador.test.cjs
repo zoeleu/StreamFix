@@ -68,8 +68,12 @@ const servidorRecebeu = [];
 
 /** Roda o provisionador como o instalador roda: convite por stdin, JSON em stdout. */
 function provisionar(convite, extras = []) {
+    // Sem `--plataforma` o provisionador usa a do processo, e o CI roda em Linux -- que agora e
+    // um sistema de wg-quick. O padrao aqui e o do .ps1, que nunca passa a opcao; quem testa o
+    // ramo do wg-quick pede `darwin` ou `linux` explicitamente.
+    const plataforma = extras.includes("--plataforma") ? [] : ["--plataforma", "win32"];
     return new Promise(resolvePromessa => {
-        const p = spawn(process.execPath, [PROVISIONA, "--url", url, "--mtu-do-caminho", "1492", ...extras], {
+        const p = spawn(process.execPath, [PROVISIONA, "--url", url, "--mtu-do-caminho", "1492", ...plataforma, ...extras], {
             stdio: ["pipe", "pipe", "pipe"]
         });
         let saida = "";
@@ -144,6 +148,29 @@ describe("provisionamento", () => {
         assert.equal(existsSync(arquivo), false, "nao pode sobrar arquivo de um perfil recusado");
     });
 
+    test("no Linux vale o mesmo do macOS: nome curto e nenhum AllowedApps", async () => {
+        // O Linux tambem sobe por wg-quick, com o mesmo limite de 15 caracteres, e la tambem
+        // ninguem aplicaria o `#@ws:AllowedApps`.
+        const arquivo = join(pasta, "linux", "streamfix.conf");
+        require("node:fs").mkdirSync(join(pasta, "linux"), { recursive: true });
+        const r = await provisionar(CONVITE_BOM, ["--arquivo", arquivo, "--plataforma", "linux"]);
+
+        assert.equal(r.codigo, 0, r.saida + r.erro);
+        assert.equal(r.json.perfilControle, "streamfix-ctl");
+        assert.equal(/AllowedApps/.test(readFileSync(arquivo, "utf8")), false);
+        assert.equal(/AllowedApps/.test(readFileSync(r.json.arquivoControle, "utf8")), false);
+        assert.match(readFileSync(r.json.arquivoControle, "utf8"), /^AllowedIPs = 162\.159\.128\.0\/17, 1\.1\.1\.1\/32$/m);
+    });
+
+    test("no Linux, um nome de perfil longo demais e recusado antes de gastar o convite", async () => {
+        const arquivo = join(pasta, "streamfix-santiago-lnx.conf");
+        const r = await provisionar(CONVITE_BOM, ["--arquivo", arquivo, "--plataforma", "linux"]);
+
+        assert.equal(r.json.ok, false);
+        assert.match(r.json.erro, /15/);
+        assert.equal(existsSync(arquivo), false);
+    });
+
     test("no Windows o mesmo nome longo continua valendo", async () => {
         // A recusa acima e do wg-quick, nao nossa: o WireSock aceita nome longo sem reclamar.
         const arquivo = join(pasta, "streamfix-santiago-win.conf");
@@ -199,7 +226,7 @@ describe("provisionamento", () => {
         const p = await new Promise(r => {
             const s = spawn(process.execPath, [
                 PROVISIONA, "--url", "http://127.0.0.1:1/registrar",
-                "--mtu-do-caminho", "1492", "--arquivo", arquivo
+                "--mtu-do-caminho", "1492", "--plataforma", "win32", "--arquivo", arquivo
             ], { stdio: ["pipe", "pipe", "pipe"] });
             let out = "";
             s.stdout.on("data", d => out += d);
@@ -1023,8 +1050,44 @@ describe("deriva entre o instalador de Windows e o de shell", () => {
         // Medido em 17/09: ate LER se o tunel esta de pe exige root. Sem `wg show` na regra, o
         // porteiro nao consegue responder a pergunta que ele existe para responder, e toda
         // transmissao boa seria recusada com "nao consegui falar com o tunel".
-        assert.match(SHELL, /"\$wg_bin" > "\$tmp"/);
-        assert.match(SHELL, /%s show \*/);
+        assert.match(SHELL, /"\$wg_bin" "\$extra" > "\$tmp"/);
+        assert.match(SHELL, /%s show \*%s/);
+    });
+
+    test("no Linux a regra de sudoers libera a listagem do /etc/wireguard, e so ela", () => {
+        // Medido em 30/10 no Arch: o pacote cria o /etc/wireguard `drwx------ root`. Sem esta
+        // entrada `existe()` responde `desconhecido` para sempre e o plugin fica no completo.
+        assert.match(SHELL, /extra=", \$LINUX_LS -1 \$WG_DIR"/);
+    });
+
+    test("os caminhos do Linux do instalador sao os mesmos que o plugin chama", () => {
+        // A regra de sudoers so casa se os dois lados escreverem o mesmo caminho. Divergir aqui
+        // e o sudo pedindo senha, que ninguem ve, no clique do Go Live.
+        const pares = [
+            ["LINUX_WG_QUICK", "WG_QUICK_LINUX"],
+            ["LINUX_WG", "WG_LINUX"],
+            ["LINUX_BASH", "BASH_LINUX"],
+            ["LINUX_LS", "LS_LINUX"]
+        ];
+        for (const [sh, ts] of pares) {
+            const noSh = new RegExp(`^${sh}="([^"]+)"$`, "m").exec(SHELL)?.[1];
+            const noTs = new RegExp(`export const ${ts} = "([^"]+)"`).exec(CONTROLE_WG)?.[1];
+            assert.ok(noSh, `${sh} sumiu do instalador`);
+            assert.equal(noSh, noTs, `${sh} e ${ts} divergem`);
+        }
+    });
+
+    test("o diretorio de perfis do instalador e o mesmo que o plugin lista", () => {
+        const noSh = /^WG_DIR="([^"]+)"$/m.exec(SHELL)[1];
+        const noTs = /export const DIR_PERFIS = "([^"]+)"/.exec(CONTROLE_WG)[1];
+        assert.equal(noSh, noTs);
+    });
+
+    test("no Linux, um Discord de flatpak ganha o acesso ao flatpak-spawn", () => {
+        // Dentro do sandbox nao existe sudo nem wg: o native.ts sai para o host por
+        // `flatpak-spawn --host`, que so funciona com o portal liberado.
+        assert.match(SHELL, /--talk-name="\$nome"/);
+        assert.match(SHELL, /grant_flatpak_host_spawn "\$flatpak_id"/);
     });
 
     test("o instalador chama o wg-quick por um bash 4+, nunca direto", () => {
